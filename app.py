@@ -1153,7 +1153,7 @@ def llm_as_judge(df_api_type, query, user_keywords,selected_domain_final, select
     )
     base_url="https://openrouter.ai/api/v1"
     headers = {
-    "Authorization": "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",
+    "Authorization": "sk-",
     "Content-Type": "application/json",
     # Enable debugging to see parameter transformations and defaults
     "X-OpenRouter-Metadata": "enabled" 
