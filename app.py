@@ -790,10 +790,14 @@ def compute_bm25(query, documents):
     #print("tokendoc",tokenized_documents)
 
     # Inisialisasi model BM25
-    bm25 = BM25Okapi(tokenized_documents)
+    bm25 = BM25Okapi(tokenized_documents,
+                     k1=1.5,
+                     b=0.75,
+                     epsilon=0.25)
 
     # Menghitung skor BM25 untuk query
     scores = bm25.get_scores(tokenized_query)
+	
     
     return scores
 
