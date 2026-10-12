@@ -1,3 +1,5 @@
+from email.utils import quote
+
 import nltk
 
 def ensure_nltk_resource(resource_name, download_name=None):
@@ -49,10 +51,7 @@ from streamlit_tags import st_tags
 import re
 #from urllib.parse import urlparse
 #import uuid
-import warnings
 import PyPDF2
-from PyPDF2.errors import PdfReadWarning
-import pikepdf
 #import io
 from bs4 import BeautifulSoup
 import torch
@@ -66,14 +65,18 @@ import numpy as np
 import json
 from openai import OpenAI
 from datetime import datetime, date
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
 import base64
+import warnings
 warnings.filterwarnings(
     "ignore",
     message="Multiple definitions in dictionary"
 )
 
-
 st.set_page_config(layout="wide")
+#st.cache_data.clear()
+#st.cache_resource.clear()
 
 USER_CREDENTIALS = {
     "tresna": "ansert123",
@@ -91,7 +94,7 @@ def login():
             <div>
                 <h2 style="margin: 0; padding: 0;">Welcome to ARPACS Project</h2>
                 <p style="margin: 4px 0 0 0; font-size: 14px; color: gray;">
-                    A Reference Paper Collection System – Open Access-based Journal API
+                    A Reference Paper Collection System – Open Access Paper Retrieval via APIs
                 </p>
             </div>
         </div>
@@ -137,22 +140,12 @@ def extract_abstract_from_url(url):
 
     try:
         pdf_reader = PyPDF2.PdfReader(pdf_file)
-    except PyPDF2.errors.PdfReadError as e:
+    except PyPDF2.errors.PdfReadError:
+        pdf_file.seek(0)
         try:
-            # Coba PyPDF2 dengan strict=False
-            pdf_file.seek(0)
             pdf_reader = PyPDF2.PdfReader(pdf_file, strict=False)
-        except PyPDF2.errors.PdfReadError:
-            # Fallback minor: perbaiki PDF pakai pikepdf
-            try:
-                pdf_file.seek(0)
-                pdf_fixed = pikepdf.open(pdf_file)
-                fixed_buffer = BytesIO()
-                pdf_fixed.save(fixed_buffer)
-                fixed_buffer.seek(0)
-                pdf_reader = PyPDF2.PdfReader(fixed_buffer, strict=False)
-            except Exception:
-                return "N/A"  # PDF tidak bisa diperbaiki
+        except:
+            return "N/A"
 
     # Ambil halaman pertama
     page = pdf_reader.pages[0]
@@ -184,8 +177,7 @@ def extract_abstract_from_url(url):
                 remove_pattern = r'(Keywords:|KEYWORDS:|Key words:|Key Words:|Received:|Accepted:|Published:).*'
                 
                 abstract_text = re.sub(remove_pattern, '', abstract_text, flags=re.IGNORECASE | re.DOTALL).strip()
-                abstract_text = abstract_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
-            
+                
 
 
     return abstract_text if abstract_text else "N/A"
@@ -232,7 +224,6 @@ def extract_keywords_from_url(url):
     try:
         # Mengambil file PDF dari URL
         response = requests.get(url, timeout=3)
-        print(f"Attempting to retrieve PDF from {url}, status code: {response.status_code}")
         response.raise_for_status()
     except requests.exceptions.SSLError:
         try:
@@ -246,16 +237,13 @@ def extract_keywords_from_url(url):
 
     if response.status_code == 200:
         # Membaca konten PDF
-        
         pdf_file = BytesIO(response.content)
-        
 
         
         # Jika bukan PDF atau PDF gagal, lanjutkan dengan file DOCX
         if url.endswith('.docx') or is_valid_docx(pdf_file):
             try:
                 docx_text = extract_keywords_from_docx(pdf_file)
-                docx_text = docx_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
                 if docx_text:
                     return docx_text  # Mengembalikan kata kunci dari DOCX
             except Exception as ex:
@@ -266,23 +254,15 @@ def extract_keywords_from_url(url):
 
             try:
                 pdf_reader = PyPDF2.PdfReader(pdf_file)
-                print(f"PDF loaded successfully from {url}")
             except PyPDF2.errors.PdfReadError as e:
-                try:
-                    # Coba PyPDF2 dengan strict=False
+                if "EOF marker not found" in str(e):
                     pdf_file.seek(0)
-                    pdf_reader = PyPDF2.PdfReader(pdf_file, strict=False)
-                except PyPDF2.errors.PdfReadError:
-                    # Fallback minor: perbaiki PDF pakai pikepdf
                     try:
-                        pdf_file.seek(0)
-                        pdf_fixed = pikepdf.open(pdf_file)
-                        fixed_buffer = BytesIO()
-                        pdf_fixed.save(fixed_buffer)
-                        fixed_buffer.seek(0)
-                        pdf_reader = PyPDF2.PdfReader(fixed_buffer, strict=False)
-                    except Exception:
-                        return "N/A"  # PDF tidak bisa diperbaiki
+                        pdf_reader = PyPDF2.PdfReader(pdf_file, strict=False)
+                    except PyPDF2.errors.PdfReadError:
+                        return "N/A"  # PDF format error
+                else:
+                    return "N/A"  # Other PDF reading error
 
 
         keywords_text = None
@@ -298,15 +278,12 @@ def extract_keywords_from_url(url):
         num_pages = len(pdf_reader.pages)
         all_text = ""
         
-            
-        try:
-            for page_num in range(min(2, num_pages)):
-                page = pdf_reader.pages[page_num]
-                text = page.extract_text() or ""
-                text=text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
-                all_text += text
-        except Exception:
-            return "N/A"
+
+        for page_num in range(min(2, num_pages)):  # Batasi hingga maksimal 2 halaman
+            page = pdf_reader.pages[page_num]
+            text = page.extract_text() or ""
+            lines = text.splitlines()
+            all_text +=text
 
 
         # Regex untuk mencari kata kunci yang ada setelah label "Keywords" dalam baris yang sama
@@ -342,17 +319,13 @@ def extract_keywords_from_url(url):
             keywords_text = keywords_text.replace("\n", " ")
             keywords_text = re.sub(r"=--", " ", keywords_text)
             keywords_text = re.sub(r"=-", " ", keywords_text)
-            keywords_text = keywords_text.replace(",", "N/A")
 
-            #keywords_text = keywords_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
-            
             
             if keywords_text and keyword_label_line_num is not None:
                 return f"{keywords_text}"
-            elif (keywords_text is None or (isinstance(keywords_text, float) and pd.isna(keywords_text)) or keywords_text == ""):
-                keywords_text = "N/A"
             else:
                 return f"{keywords_text}"
+        
         
         # Jika tidak ditemukan dalam satu baris, coba regex lain untuk kondisi Keywords \n
         match_newline = re.search(r'(Keywords?|KEYWORDS|Key Words|Index Terms)\s*[:]*\s*(.+?)(?=\s*(?:Introduction|Background|1\.|I\.|Received:|Accepted:|Published:|To whom correspondence|Frontier|The Author|. CC-BY|=-|\d{4}/\d{2}/\d{2}|\d{1,2} \w{3} \d{4}|Abbreviations|How to cite this Article|doi:|arXiv:|Manuscript received|Manuscri pt|ABSTRACT|Data and Code Availability|All rights reserved|=- |Correspondence:|\b\s+\b\w+\b\s+\b\w+\b\s+\b\w+\b\s+\b\w+\b\s+\b\w+\b\s+\b\w+\b\s+\b\w+\b|$))', all_text, re.IGNORECASE | re.DOTALL)
@@ -368,17 +341,15 @@ def extract_keywords_from_url(url):
                     keyword_label_line_num = i + 1
                     break
             
+            keywords_text = keywords_text.replace("\n", " ")
             keywords_text = re.sub(r"=--", " ", keywords_text)
             keywords_text = re.sub(r"=-", " ", keywords_text)
-            keywords_text = keywords_text.replace(",", "N/A")
-            keywords_text = keywords_text.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
-            
+
             
             if keywords_text and keyword_label_line_num is not None:
                 #return f"Keywords <line {keyword_label_line_num}>\n{keywords_text} <line {keyword_label_line_num + len(keywords_text.splitlines())}>"
                 return f"{keywords_text}"
-            elif (keywords_text is None or (isinstance(keywords_text, float) and pd.isna(keywords_text)) or keywords_text == ""):
-                keywords_text = "N/A"
+           
             else:
                 return f"{keywords_text}"
 
@@ -460,14 +431,17 @@ def extract_abstract_pmc_pubmed(url):
         #print(f"Error extracting abstract from {url}: {e}")
         return "N/A"
 
+  
+def get_journal_data_crossref(doi, key, default_value=None):
 
-def get_journal_data_crossref(doi, key, default_value="N/A"):
-    # Membuat URL untuk CrossRef API
-    url = f"https://api.crossref.org/works/{doi}"
+    url = f"https://api.crossref.org/works/{quote(doi)}"
+    headers = {
+            "User-Agent": "AcademicResearch/1.0 (mailto:tresnamf@s.okayama-u.ac.jp)"
+    }
+
+    response = requests.get(url, headers=headers, timeout=20)
     
-    # Mengirim permintaan ke API
-    response = requests.get(url)
-    
+        
     # Cek apakah respons berhasil
     if response.status_code == 200:
         metadata = response.json()
@@ -693,7 +667,7 @@ def load_model():
         st.success(f"Model loaded successfully on {device.upper()}!")
         #model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v1", device=device)
         #model =  SentenceTransformer("sentence-transformers/all-distilroberta-v1", device=device) 6m 3s 1l 56sec -->7
-        model =  SentenceTransformer("cross-encoder/ms-marco-MiniLM-L6-v2", device=device) 
+        model =  SentenceTransformer("sentence-transformers/all-mpnet-base-v2", device=device) 
         #model =  SentenceTransformer("allenai/scibert_scivocab_uncased", device=device) 4h 6m 67.50 sec --> 7
         #model =  SentenceTransformer("allenai/specter", device=device) 4h 6m 90.32sec --> 5
         
@@ -765,14 +739,37 @@ def compute_similarity(user_keywords, extracted_keywords, model, existing_emb=No
     if not user_keywords or not extracted_keywords or not user_keywords.strip() or not extracted_keywords.strip():
         return 0.0, None
 
+    
+
     # Normalize
     user_keywords = user_keywords.lower()
     extracted_keywords = extracted_keywords.lower()
+
     
-    similarity_score = model.predict([(user_keywords, extracted_keywords)])
+    # Query embedding selalu dihitung (query hanya 1 di seluruh proses)
+    user_embedding = model.encode(user_keywords,device=model.device)
 
+    # Jika embedding title sudah tersedia → langsung pakai
+    if existing_emb is not None:
+        try:
+            extracted_embedding = np.array(existing_emb,dtype=np.float32)
+            #print("saya existing embedd")
+        except:
+            extracted_embedding = model.encode(extracted_keywords,device=model.device)
+            #print("saya extract keyword 1")
+    else:
+        # Kalau belum ada embedding simpanan, encode baru
+        extracted_embedding = model.encode(extracted_keywords,device=model.device)
+        #print("saya extract keyword 2", extracted_keywords)
 
-    return similarity_score, 0
+    # Hitung cosine similarity
+    try:
+        similarity_score = util.cos_sim(user_embedding, extracted_embedding).item()
+    except Exception as e:
+        print(f"Error during similarity calculation: {e}")
+        return 0.0, extracted_embedding
+
+    return similarity_score, extracted_embedding
 
 
 
@@ -795,7 +792,7 @@ def compute_bm25(query, documents):
     #print("tokendoc",tokenized_documents)
 
     # Inisialisasi model BM25
-    bm25 = BM25Okapi(tokenized_documents,
+    bm25 = BM25Okapi(tokenized_documents,                     
                      k1=1.5,
                      b=0.75,
                      epsilon=0.25)
@@ -887,8 +884,218 @@ def bert_summary(abstract, max_sentences=20,device="cuda"):
     summary = '. '.join([sentences[i] for i in sorted(top_idx)])
     return summary
 
+
+def lda_modeling(df):
+
+    # =========================
+    # Load CSV
+    # =========================
+
+    # Ambil kolom Abstract
+    documents = (
+        df['Title'].astype(str)
+        + " "
+        + df['Abstract'].astype(str)
+    ).tolist()
+
+    # =========================
+    # Count Vectorizer
+    # =========================
+    # LDA lebih cocok menggunakan CountVectorizer
+    # dibanding TF-IDF
+
+    vectorizer = CountVectorizer(
+        stop_words='english',
+        max_features=500,
+        ngram_range=(1,2),
+        min_df=2,
+        max_df=0.85
+        
+    )
+
+    doc_term_matrix = vectorizer.fit_transform(documents)
+
+    terms = vectorizer.get_feature_names_out()
+
+    #print("=== Vocabulary Terms ===")
+    #print(terms)
+
+    # =========================
+    # LDA Model
+    # =========================
+
+    lda_model = LatentDirichletAllocation(
+        n_components=10,
+        random_state=42,
+        learning_method='batch',
+        max_iter=20
+    )
+
+    lda_matrix = lda_model.fit_transform(doc_term_matrix)
+    
+    TOP_N_TOPICS = 3
+    TOP_N_WORDS = 20
+
+    topic_contexts = []
+
+    for doc_index, topic_probs in enumerate(lda_matrix):
+
+        top_topics = topic_probs.argsort()[::-1][:TOP_N_TOPICS]
+
+        topic_text = []
+
+        for topic_idx in top_topics:
+
+            prob = topic_probs[topic_idx]
+
+            top_terms = lda_model.components_[topic_idx].argsort()[-TOP_N_WORDS:][::-1]
+
+            keywords = [
+                terms[i]
+                for i in top_terms
+            ]
+
+            topic_text.append(
+                f"Topic {topic_idx + 1} ({prob:.2%}): {', '.join(keywords)}"
+            )
+
+        topic_contexts.append("\n".join(topic_text))
+
+    # Tambahkan hasil LDA ke DataFrame
+    df["LDA_Topics"] = topic_contexts
+    
+    return df
+
+
+    # =========================
+    # Perplexity & Log Likelihood
+    # =========================
+
+    #print("\n=== Evaluation ===")
+
+    #print(
+     #   "Perplexity:",
+      #  lda_model.perplexity(doc_term_matrix)
+    #)
+
+    #print(
+     #   "Log Likelihood:",
+      #  lda_model.score(doc_term_matrix)
+    #)
+    
+def rag_metrics_embeddings(row, query, user_keywords, selected_domain_final, selected_field_final):
+
+    from datasets import Dataset
+    from ragas import evaluate
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    from ragas.metrics import faithfulness
+    from ragas.metrics import AspectCritic
+    
+
+
+
+    # Paper information as context
+    context = f"""
+    Paper Title:
+    {row['Title']}
+
+    Paper Abstract:
+    {row['Abstract']}
+
+    Paper Discipline:
+    {row['Discipline(s)']}
+
+    Paper Keywords:
+    {row['Extracted Keywords']}
+    """
+
+    question = f"""
+    Why is the retrieved paper relevant to the user query?
+
+    User Query:
+    {query}
+
+    Query Keywords:
+    {user_keywords}
+
+    Query Research Domain:
+    {selected_domain_final}
+
+    Query Subject Field:
+    {selected_field_final}
+
+   """
+
+
+
+
+
+    dataset = Dataset.from_dict({
+        "question": [question],
+        "answer": [row['AI Explanation']],
+        "contexts": [[context]]
+    })
+    #Relevansi Penjelasan mengukur apakah justifikasi AI mampu menghubungkan query pengguna dengan karakteristik paper secara tepat, termasuk menjelaskan kesamaan dan perbedaannya.
+    explanation_relevance = AspectCritic(
+    name="explanation_relevance",
+    definition="""
+    Evaluate the quality of the AI-generated explanation regarding the relationship between the user query and the retrieved paper.
+
+    Assign a score:
+
+    3 = Good: The explanation clearly describes the query-paper relationship and provides supporting evidence.
+
+    2 = Acceptable: The explanation identifies the relationship but lacks sufficient detail or justification.
+
+    1 = Poor: The explanation does not clearly justify the relationship or contains unsupported claims.
+
+    Answer only the score: 1, 2, or 3.
+
+
+    """
+)
+
+
+    # OpenRouter LLM evaluator
+    evaluator_llm = ChatOpenAI(
+        model="openai/gpt-4o-mini",
+        temperature=0,
+        top_p=1.0,
+        max_tokens=256,
+        seed=42,
+        openai_api_key="sk-",
+        openai_api_base="https://openrouter.ai/api/v1"
+    )
+
+
+    # OpenRouter embedding
+    evaluator_embeddings = OpenAIEmbeddings(
+        model="openai/text-embedding-3-small",
+        openai_api_key="sk-",
+        openai_api_base="https://openrouter.ai/api/v1"
+    )
+
+
+    result = evaluate(
+        dataset,
+        metrics=[
+            explanation_relevance,
+            faithfulness
+        ],
+        llm=evaluator_llm,
+        embeddings=evaluator_embeddings
+    )
+
+
+    return (
+        float(result["explanation_relevance"][0]),
+        float(result["faithfulness"][0])
+    )
+
+
+
 # Fungsi RAG evaluation semua berbasis embedding
-def rag_metrics_embeddings(row, query, user_keywords, model):
+def rag_metrics_embeddings2(row, query, user_keywords, model):
     
     
     # Preprocess texts
@@ -909,24 +1116,24 @@ def rag_metrics_embeddings(row, query, user_keywords, model):
     
     try:
         # Encode teks yang sudah diubah menjadi lowercase
-        context_emb = model.encode(context_text, device=model.device)
-        justification_emb = model.encode(justification_text, device=model.device)
-        query_emb = model.encode(query_text, device=model.device)
+        context_emb = model.encode(context_text,convert_to_tensor=True, device="cuda")
+        justification_emb = model.encode(justification_text, convert_to_tensor=True, device="cuda")
+        query_emb = model.encode(query_text, convert_to_tensor=True, device="cuda")
         
     except Exception as e:
         # Tangani kesalahan pada saat encoding
-        print(f"Error during encoding: {e}")
+        print(f"Error during encoding2: {e}")
         return 0.0
     
     try:
         # Menghitung cosine similarity
         
         faithfulness = util.cos_sim(justification_emb, context_emb).item()
-        answer_relevancy = util.cos_sim(justification_emb, query_emb).item()
+        explanation_relevance = util.cos_sim(justification_emb, query_emb).item()
 
     except Exception as e:
         # Tangani kesalahan saat perhitungan cosine similarity
-        print(f"Error during similarity calculation: {e}")
+        print(f"Error during similarity calculation2: {e}")
         return 0.0
     
 
@@ -936,12 +1143,11 @@ def rag_metrics_embeddings(row, query, user_keywords, model):
 
 
     
-    return faithfulness, answer_relevancy
+    return explanation_relevance,faithfulness
 
 
 
-
-def llm_as_judge(df_api_type, query, user_keywords):
+def llm_as_judge(df_api_type, query, user_keywords,selected_domain_final, selected_field_final):
     
     
     
@@ -950,6 +1156,13 @@ def llm_as_judge(df_api_type, query, user_keywords):
     base_url="https://openrouter.ai/api/v1",
     api_key="sk-",
     )
+    base_url="https://openrouter.ai/api/v1"
+    headers = {
+    "Authorization": "sk-",
+    "Content-Type": "application/json",
+    # Enable debugging to see parameter transformations and defaults
+    "X-OpenRouter-Metadata": "enabled" 
+}
     # ==================================
 
 
@@ -969,8 +1182,44 @@ def llm_as_judge(df_api_type, query, user_keywords):
 
     few_shot_text = ""
 
+    # pastikan numeric
+    df_api_type['Final Average Human Rating'] = pd.to_numeric(
+        df_api_type['Final Average Human Rating'], errors='coerce'
+    )
+
     for cat in categories:
-        examples = df_api_type[df_api_type['Relevance Category'] == cat].head(3)
+        print("\n=== CATEGORY:", cat, "===")
+
+        # 🔹 PRIORITY 1: dari human rating
+        filtered = df_api_type[
+            (df_api_type['Final Average Human Rating'].notna()) &
+            (df_api_type['Final Average Human Rating'] >= 0)
+        ].copy()
+
+        # mapping rating → category
+        filtered['mapped_category'] = filtered['Final Average Human Rating'].apply(
+            lambda x: relevance_map.get(int(round(x)), None)
+        )
+
+        # ambil sesuai kategori
+        filtered_cat = filtered[filtered['mapped_category'] == cat]
+
+        print("From human rating:", len(filtered_cat))
+
+        # 🔹 PRIORITY 2: fallback
+        if len(filtered_cat) >= 3:
+            examples = filtered_cat.head(3)
+        else:
+            fallback = df_api_type[
+                df_api_type['Relevance Category'] == cat
+            ]
+
+            examples = pd.concat([filtered_cat, fallback]) \
+                .drop_duplicates(subset=['Title']) \
+                .head(3)
+
+        print("Final selected:", len(examples))
+            
         for i, row in examples.iterrows():
             val = row["Final Average Human Rating"]
 
@@ -981,12 +1230,23 @@ def llm_as_judge(df_api_type, query, user_keywords):
                 final_rating = "-"
 
                 print("final_rating 1",final_rating)
+                
+            discipline_prompt = row['Discipline(s)']
+            keywords_prompt = row['Extracted Keywords']
+
+            if discipline_prompt == "N/A":
+                discipline_prompt = "-"
+
+            if keywords_prompt == "N/A":
+                keywords_prompt = "-"
 
             few_shot_text += f"""
-            
+      
     Example of results ({cat}):
     Paper Title: {row['Title']}
     Paper Abstract: {row['Abstract']}
+    Paper Discipline or Subject: {discipline_prompt}
+    Paper Keywords: {keywords_prompt}
     Current Relevant Category: {row['Relevance Category']}
     Human Rating: {final_rating}
 
@@ -1002,18 +1262,26 @@ def llm_as_judge(df_api_type, query, user_keywords):
             try:
                 response = client.chat.completions.create(
                     model='mistralai/mistral-small-24b-instruct-2501',
-                    #model='google/gemini-2.5-flash-lite',
+                    # model='google/gemini-2.5-flash-lite',
+                    # model='mistralai/Mistral-7B-Instruct-v0.3',
                     messages=[
-                            {'role': 'user', 
-                             'content': prompt}
-                         
-                            ]
+                        {
+                            'role': 'user',
+                            'content': prompt
+                        }
+                    ],
+                    temperature=0,
+                    top_p=1.0,
+                    max_tokens=256,
+                    seed=42
                 )
+                print("==========LLM Response:", response)
                 content = response.choices[0].message.content
                 # Clean possible code block markers
                 content = re.sub(r"^```(?:json)?\s*", "", content)
                 content = re.sub(r"```$", "", content)
                 content = content.strip()
+                print("Full Response:", response.model_dump())
                 
                 if not content:
                     raise ValueError("Empty response from model")
@@ -1035,8 +1303,7 @@ def llm_as_judge(df_api_type, query, user_keywords):
     # ---------------------------------------------
     
     
-
-    df_api_type_selected = df_api_type[:10]
+    df_api_type_selected = df_api_type[:50]
 
     #Given the following examples of relevance categories which generated by sentence embedding using mpnet-base-v2-model, text similarity, and threshold categories:
 
@@ -1065,7 +1332,6 @@ def llm_as_judge(df_api_type, query, user_keywords):
             #print("final_rating 2",final_rating)
 
 
-
         prompt = f"""
             You are an academic paper relevance assessor or expert judgment in expertise fields. 
 
@@ -1074,32 +1340,43 @@ def llm_as_judge(df_api_type, query, user_keywords):
             {few_shot_text}
 
             However, the few-shot examples are provided only as additional references, you may update the relevance category based on your own expert judgment in your field with reasonable justification.
-                    
-            Follow these rules when assigning the relevance categories of each paper to the query:
-                1. Highly relevant: if the domain/field are the same, the paper addresses the same core problem and topic without being more specific than the query, prioritize papers whose paper titles are lexically very similar to the query, and it uses the similar methods.
-                2. Moderately relevant: if the domain/field is the same, but the study focuses on a more specific subtopic or narrower aspect of the query, and it uses the similar or partially similar methods.
-                3. Somewhat relevant: if the paper is still in a related domain/field but covers a broader (general) aspect of the same topics and uses the similar methods, papers with different topics and do not address the primary subject of study or the core problem although using similar methods can not be included in "Somewhat relevant" category.
-                4. Low relevance: if the paper’s topic and main subject of study are unrelated to the query, or if it belongs to an entirely different domain/field. Do not assign "Somewhat relevant" to papers that merely use a similar tool or programming framework without addressing a comparable research topic or goal. It should be strictly classified as "Low relevance".
+    
+                
+            Follow these rules when assigning the relevance categories of each paper to the query context: 
 
-            Please do not overestimate the relevance of a category, do not assign Highly relevant if the paper focuses on a narrower or more specific subtopic of the query.
+            1. Highly relevant:The paper belongs to the same research domain and subject field as the query, investigates the same research topic, addresses the same or highly similar research objective, and applies similar research methods or approaches. The paper directly addresses the main focus of the query.
 
-            Now assess the relevance of the following primary section of paper to the query:
+            2. Moderately relevant:The paper belongs to the same research domain and subject field, investigates the same or closely related research topic, but addresses a narrower or more specific research objective than the query. Similar or partially similar research methods provide additional support for this category. The paper is strongly related to the query but does not fully cover the broader objective.
+
+            3. Somewhat relevant:The paper belongs to the same or a related research domain and subject field, investigates a related research topic, and addresses a broader, more general, or different research objective than the query. The paper shares some relevant aspects with the query but does not directly address the main research objective.
+
+            4. Low relevance:The paper belongs to a different research domain or subject field, or investigates an unrelated research topic. Similar research methods, algorithms, or technical approaches alone are not sufficient to classify a paper as relevant.
+            
+            For all relevance categories, ignore the scope of geographic location.
+            Please do not overestimate the relevance of a category, do not assign Highly relevant if the paper focuses on a narrower or more specific subtopic of the query context.
+
+
+            Now assess the relevance of the following primary section of paper to the query context:
 
                 1. User Query: 
-                    a. Title/topic query: {query}
-                    b. Keywords: {user_keywords}
+                    a. Title/topic: {query}
+                    b. Keywords (as supplementary): {user_keywords}
+                    c. Domain: {selected_domain_final}
+                    d. Field: {selected_field_final}
                 2. Paper Information:
                     a. Paper Title: {row['Title']}
                     b. Paper Abstract: {row['Abstract']}
-                    c. Current Relevance Category: {row['Relevance Category']}
-                    d. Human Rating: {final_rating}
+                    c. Paper Discipline or Subject: {discipline_prompt}
+                    d. Paper Keywords: {keywords_prompt}
+                    e. Current Relevance Category: {row['Relevance Category']}
+                    
 
             Please output a JSON object with these keys:
             {{
                 "Updated Relevance Category": <Highly relevant | Moderately relevant | Somewhat relevant | Low relevance>,
-                "Short Explanation": "<Brief justification for your assessment based above rules (1–2 sentences), explaining why the paper is relevant to the query in concise, factual, and faithful.>",
-                "Human Rating": "{final_rating}"
-            }}
+                "Short Explanation": "<Provide a brief justification in 1–2 sentences. Start by explaining the direct relationship between the paper and the user's query topic. Then provide supporting evidence from the paper metadata, such as the main objective, developed system, or approach. Focus on the most relevant information only and avoid listing all relevance criteria or adding unsupported claims.>",
+                
+            }} 
 
 
             """
@@ -1191,7 +1468,7 @@ def llm_as_judge(df_api_type, query, user_keywords):
     df_api_type_selected['Human and AI Ratings'] = final_categories
     df_api_type_selected['Human and AI Ratings Explanation'] = final_explanations
     
-    
+    #df_api_type_selected.to_csv("df_api_type_selected.csv", index=False)
 	
     
     return df_api_type_selected
@@ -1457,6 +1734,7 @@ def insert_ai_rating(df, get_id_query_history, get_id_papers):
                 row['Title BM25 Score'],
                 row['Abstract BM25 Score'],
                 row['Total BM25 Score'],
+
                 row['Title BERT Score'],
                 row['Abstract BERT Score'],
                 row['Extracted Keywords BERT Score'],
@@ -1467,8 +1745,8 @@ def insert_ai_rating(df, get_id_query_history, get_id_papers):
                 row['Similarity Score'],
 
                 row['Relevance Category'],
-                0,
-                0
+                row['AI Relevance Category'],
+                row['AI Explanation']
             )
             cursor.execute(insert_query, data)
             inserted_ids.append(cursor.lastrowid)  # simpan ID tiap insert
@@ -1552,14 +1830,14 @@ def insert_human_rating(df, get_id_papers, get_id_query_history):
 
 
 
-def insert_syst_perform(performance_retrieval,collection_retrieval, get_id_query_history):
+def insert_syst_perform(average_ragas_scores, performance_retrieval,collection_retrieval, get_id_query_history):
     try:
         conn = get_connection()
         cursor = conn.cursor()
 
         insert_query = """
         INSERT INTO tb_system_performance (
-            id_query_hist, paper_collected, answer_relevancy, faithfulness,
+            id_query_hist, explanation_relevance, faithfulness, paper_collected,
             response_time, initial_memory_usage, final_memory_usage, memory_used,
             percentage_cpu_usage, total_logical_processor, total_cpu_usage_core, created_at_syst_perform
         )
@@ -1568,9 +1846,9 @@ def insert_syst_perform(performance_retrieval,collection_retrieval, get_id_query
 
         values = (
             get_id_query_history,
+            average_ragas_scores.get('Explanation Relevance'),
+            average_ragas_scores.get('Faithfulness'),
             collection_retrieval.get('successfully_collected'),
-            0,
-            0,
             performance_retrieval.get('Execution Time'),
             performance_retrieval.get('Initial Memory Usage'),
             performance_retrieval.get('Final Memory Usage'),
@@ -1578,7 +1856,7 @@ def insert_syst_perform(performance_retrieval,collection_retrieval, get_id_query
             performance_retrieval.get('Percentage of CPU Usage'),
             performance_retrieval.get('Total Logical Processor'),
             performance_retrieval.get('Total CPU Usage in Core')
-            
+
         )
 
         cursor.execute(insert_query, values)
@@ -1692,55 +1970,110 @@ def select_get_title_db(user_query):
 
     return df_api_type
 
+def select_human_rating_stats(df, query):
 
-
-def select_human_rating_stats(df):
     conn = get_connection()
-
     results = []
+    threshold=4
+    
+    # 🔹 Preprocess query → keywords
+    keywords = query.lower().split()
+    like_clauses = " + ".join(["(LOWER(query_title_hist) LIKE %s)" for _ in keywords])
+    params = [f"%{kw}%" for kw in keywords]
 
-    sql = """
-        SELECT
-            p.id_paper,
-            p.title_paper,
-            CASE 
-                WHEN SUM(hr.human_rating_high + hr.human_rating_moderate + hr.human_rating_somewhat + hr.human_rating_low) > 0
-                THEN (SUM(hr.human_rating_high)*3 + SUM(hr.human_rating_moderate)*2 + SUM(hr.human_rating_somewhat)) /
-                     (SUM(hr.human_rating_high + hr.human_rating_moderate + hr.human_rating_somewhat + hr.human_rating_low))
-                ELSE NULL
-            END AS final_human_average
-        FROM tb_papers p
-        LEFT JOIN tb_human_rating hr ON hr.id_paper = p.id_paper
-        WHERE p.title_paper = %s
-        GROUP BY p.id_paper, p.title_paper
+    with conn.cursor(dictionary=True, buffered=True) as cursor:
+
+        # =====================================================
+        # STEP 1: Ambil query_history yang match (≥ threshold)
+        # =====================================================
+        sql_qh = f"""
+        SELECT id_query_hist
+        FROM tb_query_history
+        WHERE {like_clauses} >= %s
+        """
+
+        cursor.execute(sql_qh, params + [threshold])
+        qh_rows = cursor.fetchall()
+
+        qh_ids = [row['id_query_hist'] for row in qh_rows]
+
+    # ❗ Kalau tidak ada query_history yang match
+    if len(qh_ids) == 0:
+        for title in df['Title']:
+            results.append({
+                'title_paper': title,
+                'final_human_average': -2  # tidak ada data
+            })
+        return pd.DataFrame(results)
+
+    # =====================================================
+    # STEP 2: Ambil rating berdasarkan qh_ids
+    # =====================================================
+    placeholders = ",".join(["%s"] * len(qh_ids))
+
+    sql_main = f"""
+    SELECT
+        p.id_paper,
+        p.title_paper,
+        CASE 
+            WHEN SUM(hr.human_rating_high + hr.human_rating_moderate + 
+                     hr.human_rating_somewhat + hr.human_rating_low) > 0
+            THEN (
+                SUM(hr.human_rating_high)*3 +
+                SUM(hr.human_rating_moderate)*2 +
+                SUM(hr.human_rating_somewhat)*1
+            ) /
+            SUM(hr.human_rating_high +
+                hr.human_rating_moderate +
+                hr.human_rating_somewhat +
+                hr.human_rating_low)
+            ELSE NULL
+        END AS final_human_average
+    FROM tb_papers p
+    LEFT JOIN tb_human_rating hr 
+        ON hr.id_paper = p.id_paper
+    WHERE p.title_paper = %s
+    AND hr.id_query_hist IN ({placeholders})
+    GROUP BY p.id_paper, p.title_paper
     """
 
-
+    # =====================================================
+    # LOOP tiap paper
+    # =====================================================
     for title in df['Title']:
+
         with conn.cursor(dictionary=True, buffered=True) as cursor:
-            cursor.execute(sql, (title,))
+            cursor.execute(sql_main, [title] + qh_ids)
             row = cursor.fetchone()
-            
-            if row is None:
-                row = {
-                    
-                    'title_paper': title,
-                    'final_human_average': -2 #paper tidak ditemukan di db
-                }
 
-            elif row['final_human_average'] is None:
-                row['final_human_average'] = -1  # Match tapi tidak ada human rating
-            results.append(row)
+        if row is None:
+            row = {
+                'title_paper': title,
+                'final_human_average': -2  # tidak ada rating sama sekali
+            }
 
+        elif row['final_human_average'] is None:
+            row['final_human_average'] = -1  # ada tapi kosong
+
+        results.append(row)
+
+    # =====================================================
+    # MERGE ke dataframe awal
+    # =====================================================
     df_results = pd.DataFrame(results)
-    df_merged = df.merge(df_results[['title_paper', 'final_human_average']],
-                         left_on='Title', right_on='title_paper', how='left')
-    
-    # Drop kolom title_paper hasil merge
+
+    df_merged = df.merge(
+        df_results[['title_paper', 'final_human_average']],
+        left_on='Title',
+        right_on='title_paper',
+        how='left'
+    )
+
     df_merged.drop(columns=['title_paper'], inplace=True)
 
-    # Rename final_human_average
-    df_merged.rename(columns={'final_human_average': 'Final Average Human Rating'}, inplace=True)
+    df_merged.rename(columns={
+        'final_human_average': 'Final Average Human Rating'
+    }, inplace=True)
 
     return df_merged
 
@@ -2141,8 +2474,9 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
         st.stop()
 
 
-
-
+    
+    
+    
     # Gabungkan user_keywords dengan Title untuk membuat input user
     
     #1. Semantic Scholar and DOAJ refine data
@@ -2225,7 +2559,34 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
 
             
             
-        
+            
+            
+            
+           
+            df_api_type['Title BM25 Score'] = pd.NA
+            df_api_type['Title BM25 Score'] = compute_bm25(query, df_api_type['Title'])
+            
+            #df_api_type['Title PAV'] = apply_pav_with_sigmoid(df_api_type['Title BM25 Score'])
+            
+            combined_query_abstract = ", ".join(filter(None, [
+            str(selected_domain_final),
+            str(selected_field_final),
+            str(" ".join(user_keywords)),
+            str(query)
+            ]))
+            df_api_type['Abstract BM25 Score'] = pd.NA
+            df_api_type['Abstract BM25 Score'] = compute_bm25(combined_query_abstract,df_api_type['Abstract'] )
+            #df_api_type['Abstract PAV'] = apply_pav_with_sigmoid(df_api_type['Abstract BM25'])
+            
+            
+            df_api_type['Total BM25 Score'] = df_api_type[['Title BM25 Score', 'Abstract BM25 Score']].sum(axis=1)
+            if len(df_api_type) > 100:
+                # Sortir dataframe berdasarkan kolom 'Total BM25' secara descending
+                df_api_type = df_api_type.sort_values(by='Total BM25 Score', ascending=False)
+                
+                # Ambil 100 baris pertama setelah disorting
+                df_api_type = df_api_type.head(100)
+                #df_api_type.to_csv("output_bm25.csv",index=False,encoding="utf-8-sig")
             
             
             
@@ -2311,44 +2672,33 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
                     
                     df_api_type['Extracted Keywords'] = df_api_type['Extracted Keywords'].str.replace(r'[^\x00-\x7F]+', 'N/A', regex=True)
                     # Ekstraksi keywords ALL
-                    df_api_type.to_csv("output_extract_keywords1.csv", index=False)
                     mask_na = df_api_type['Extracted Keywords'].isna() | (df_api_type['Extracted Keywords'] == "N/A")
                     keywords_to_extract = df_api_type.loc[mask_na, 'Open Access PDF URL']
                     keywords_to_extract_func = list(executor.map(extract_keywords_from_url, keywords_to_extract))
                     df_api_type.loc[mask_na, 'Extracted Keywords'] = keywords_to_extract_func
-                    df_api_type.to_csv("output_extract_keywords2.csv", index=False)
-                    
-                    print("Starting data refinement for ISSN and Impact Factor...")
-   
-                    
+         
             
             
 
         
-            
+       
             #Refine Retrieve ISSN from Crossref SS, DOAJ, PubMed
-            df_api_type['ISSN'] = pd.NA
+            #df_api_type['ISSN'] = pd.NA
 
+        with ThreadPoolExecutor() as executor:
             df_api_type['ISSN'] = list(
-                    executor.map(
-                    lambda doi: get_journal_issn_crossref(doi),  # Memanggil fungsi untuk setiap DOI
-                    df_api_type['DOI']
-                    )
-                )
-                    
-            #Refine Retrieve Impact Factor SS, DOAJ, PubMed
-            df_api_type['Impact Factor'] = pd.NA
-            df_api_type['Impact Factor'] = list(
-                    executor.map(
-                        lambda issn: get_journal_if(issn),  # Memanggil fungsi untuk setiap DOI
-                        df_api_type['ISSN']
-                        )
+                executor.map(get_journal_issn_crossref, df_api_type['DOI'])
             )
 
-            
-    df_api_type['Title BM25 Score'] = 0.0
-    df_api_type['Abstract BM25 Score'] = 0.0
-    df_api_type['Total BM25 Score'] =  0.0
+        # barrier otomatis di sini (keluar dari block)
+
+        with ThreadPoolExecutor() as executor:
+            df_api_type['Impact Factor'] = list(
+                executor.map(get_journal_if, df_api_type['ISSN'])
+            )
+
+            #df_api_type.to_csv("output_if2.csv",index=False,encoding="utf-8-sig")
+
         
     # Inisialisasi kolom kosong dulu
     cols = ['Title BERT Score', 'Abstract BERT Score', 'Extracted Keywords BERT Score', 
@@ -2357,8 +2707,6 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
 
 
     df_api_type[cols] = None
-    
-
     
     # Pastikan kolom embedding ada sebelum digunakan
     embed_cols = [
@@ -2437,6 +2785,7 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
     #Second checking stage - Sentence Embedding
     with ThreadPoolExecutor() as executor:
         df_api_type['Citation Count'] = df_api_type['Citation Count'].replace('N/A', 0)
+ 
         # Normalisasi Citation Count dan Impact Factor sebelum menghitung similarity
         min_citation, max_citation = normalize_values(df_api_type, 'Citation Count')
         
@@ -2467,17 +2816,32 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
 
     #df_api_type.to_excel("output22222222.xlsx", index=False)
    
+
+    # Check whether Similarity Score exceeds 1
+    if df_api_type["Similarity Score"].max() > 1:
+        
+        S_min = df_api_type["Similarity Score"].min()
+        S_max = df_api_type["Similarity Score"].max()
+
+        # Normalize only if score range exceeds 1
+        df_api_type["Similarity Score"] = (
+            (df_api_type["Similarity Score"] - S_min) /
+            (S_max - S_min)
+        )
+
+    # Assign relevance category
     with ThreadPoolExecutor() as executor:
-            df_api_type["Relevance Category"] = list(executor.map(
-            lambda val: (
-                "Highly relevant 2" if val >=0.8 else
-                "Moderately relevant" if 0.6 <= val < 0.8 else
-                "Somewhat relevant" if 0.4 <= val < 0.6 else
-                "Low relevance"
-            ),
-            df_api_type["Similarity Score"]
-        ))
-    
+        df_api_type["Relevance Category"] = list(
+            executor.map(
+                lambda val: (
+                    "Highly relevant" if val >= 0.8 else
+                    "Moderately relevant" if 0.6 <= val < 0.8 else
+                    "Somewhat relevant" if 0.4 <= val < 0.6 else
+                    "Low relevance"
+                ),
+                df_api_type["Similarity Score"]
+            )
+        )
     
     df_api_type['Relevance Category'] = df_api_type['Relevance Category'].replace({
     'Highly relevant 1': 'Highly relevant',
@@ -2488,27 +2852,17 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
     #df_api_type.to_excel("output_first_checkc.xlsx", index=False)
     
     
+    #df_api_type=lda_modeling(df_api_type)
+    
+
     #Select human rating stats from DB
-    #df_api_type = select_human_rating_stats(df_api_type)
+    df_api_type = select_human_rating_stats(df_api_type,query)
     #df_api_type.to_excel("output_first_check-humanrating.xlsx", index=False)
-    #print("Starting RAG as judge stage")
+    print("Starting RAG as judge stage")
     #RAG as judge
-    #df_api_type=llm_as_judge(df_api_type, query, user_keywords)
+    df_api_type=llm_as_judge(df_api_type, query, user_keywords, selected_domain_final, selected_field_final)
     
     #df_api_type.to_excel("output_first_check-llm.xlsx", index=False)
-    
-        
-   #with ThreadPoolExecutor() as executor:
-    #    results_rag_metric = list(
-     #       executor.map(lambda row: rag_metrics_embeddings(row, query, user_keywords, model), [row for _, row in df_api_type.iterrows()])
-    
-      #  )
-
-    #eval_df_rag_metric = pd.DataFrame(results_rag_metric)
-    #top10 = eval_df_rag_metric.head(10)
-    #answer_relevancy, faithfulness = top10.mean()
-    #answer_relevancy, faithfulness = eval_df_rag_metric.mean()
-        
     
 
     # Filter: Hanya yang memiliki 'Open Access PDF URL' != 'N/A' atau 'Extracted Keywords' != 'N/A'
@@ -2538,8 +2892,10 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
     df_api_type.reset_index(inplace=True)                   # pindahkan index menjadi kolom
     df_api_type.rename(columns={"index": "Index"}, inplace=True)
     df_api_type["Index"] = range(1, len(df_api_type) + 1)   # set ulang jadi 1..N
+    
+    #df_api_type.to_csv("output_embeddings.csv", index=False)
 
-    df_api_type.to_csv("output_embeddings.csv", index=False)
+    #df_api_type.to_excel("output1a.xlsx", index=False)
     #st.success(f"Vector Embedding Title: {type(df_api_type['Vector Embedding Title'])}")
     #st.success(f"Vector Embedding Abstract: {type(df_api_type['Vector Embedding Abstract'])}")
     #st.success(f"Vector Embedding Extracted Keywords: {type(df_api_type['Vector Embedding Extracted Keywords'])}")
@@ -2566,14 +2922,77 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
         #st.success(f"Query ID insert_ai_rating: {get_id_ai_rating}")
     except Exception as e:
         st.error(f"Database insert failed tb_ai_rating: {e}")   
-    
-    #df_api_type.to_excel("output1c.xlsx", index=False)
+      
+    #df_api_type.to_excel("output_2026.xlsx", index=False)
 
+
+    relevance_map = { 
+        "Highly relevant": 3, 
+        "Moderately relevant": 2, 
+        "Somewhat relevant": 1, 
+        "Low relevance": 0 
+    }
+
+    df_api_type['_Relevance_Score_Temp'] = df_api_type['AI Relevance Category'].map(relevance_map)
+
+    print("#1: Starting RAGAS evaluation for top-10 papers...")
+    # 1. Ambil top-10 berdasarkan relevance category dan similarity
+    df_top10 = df_api_type.sort_values(
+        by=["_Relevance_Score_Temp", "Similarity Score"],
+        ascending=[False, False]
+    ).head(10).copy()
+
+    print("#2: Starting RAGAS evaluation for top-10 papers...")
+    # 2. Hitung RAGAS hanya untuk top-10
+    scores = df_top10.apply(
+        lambda row: pd.Series(
+            rag_metrics_embeddings(
+                row=row,
+                query=query,
+                user_keywords=user_keywords,
+                selected_domain_final=selected_domain_final,
+                selected_field_final=selected_field_final
+            )
+        ),
+        axis=1
+    )
+
+    scores.columns = [
+        "Explanation_Relevance",
+        "Faithfulness"
+    ]
+
+
+    # 3. Gabungkan hasil RAGAS
+    df_top10 = pd.concat(
+        [df_top10.reset_index(drop=True), scores],
+        axis=1
+    )
+
+
+    # 4. Simpan hasil sementara
+    df_top10.to_csv("output_ragas_10.csv", index=False)
+    
+
+    # 5. Hapus kolom sementara setelah selesai
+    df_api_type.drop(
+        columns=["_Relevance_Score_Temp"],
+        inplace=True
+    )
+
+
+    # Rata-rata top-10
+    average_ragas_scores_get = {
+        "Explanation Relevance": df_top10["Explanation_Relevance"].mean(),
+        "Faithfulness": df_top10["Faithfulness"].mean()
+    }
+    
     
     # Calculate elapsed time
 
     elapsed_time = time.time() - start_time
     st.success(f"Data fetched in {elapsed_time:.2f} seconds!")
+    
     
     
 
@@ -2603,11 +3022,11 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
     
 
 
-    #rag_metrics_get =  {'Answer Relevancy': answer_relevancy, 'Faithfulness': faithfulness}
+
 
     #insert tb_syst_perform
     try:
-        get_id_syst_perform = insert_syst_perform(performance_retrieval_get,collection_retrieval_get, get_id_query_history)
+        get_id_syst_perform = insert_syst_perform(average_ragas_scores_get, performance_retrieval_get,collection_retrieval_get, get_id_query_history)
         #st.success(f"Query ID insert_syst_perform: {get_id_syst_perform}")
     except Exception as e:
         st.error(f"Database insert failed: {e}")   
@@ -2619,11 +3038,11 @@ def run_retrieval_pipeline(query, get_api_type_data, api_option,user_keywords,se
         
     }
     
-    df_api_type.to_csv("paper_result_mpnet.csv",index=False,encoding="utf-8-sig")
-    df_perf = pd.DataFrame([performance_retrieval_get])
-    df_perf.to_csv("perfomance_result_mpnet.csv",index=False,encoding="utf-8-sig")
+    #df_api_type.to_csv("paper_result_mistral.csv",index=False,encoding="utf-8-sig")
+    #df_perf = pd.DataFrame([performance_retrieval_get])
+    #df_perf.to_csv("perfomance_result_mistral.csv",index=False,encoding="utf-8-sig")
     
-    return df_api_type, performance_retrieval_get, collection_retrieval_get, db_ids_get
+    return df_api_type, average_ragas_scores_get,  performance_retrieval_get, collection_retrieval_get, db_ids_get
 
 
 
@@ -2634,6 +3053,8 @@ def main():
     
     if "df_api_type" not in st.session_state:
         st.session_state.df_api_type = pd.DataFrame()  # kosong di awal
+    if "average_ragas_scores" not in st.session_state:
+        st.session_state.average_ragas_scores = {}
     if "performance_retrieval" not in st.session_state:
         st.session_state.performance_retrieval = {}
     if "collection_retrieval" not in st.session_state:
@@ -2651,7 +3072,7 @@ def main():
             <div>
                 <h2 style="margin: 0; padding: 0;">Welcome to ARPACS Project</h2>
                 <p style="margin: 4px 0 0 0; font-size: 14px; color: gray;">
-                    A Reference Paper Collection System – Open Access-based Journal API
+                    A Reference Paper Collection System – Open Access Paper Retrieval via APIs
                 </p>
             </div>
         </div>
@@ -2681,7 +3102,7 @@ def main():
     "OpenAlex": "OpenAlex API",
     "Scopus": "Scopus API",
     "Web of Science": "Web of Science API",
-    "AI-Assisted Search": "AI-Assisted Search API",
+    #"AI-Assisted Search": "AI-Assisted Search API",
     "All Sources": "Multiple API Integration"
     }
     
@@ -2790,7 +3211,6 @@ def main():
         }
         
         
-
         # === select domain (with manual option) ===
         domain_list = ["-- Select Domain --"] + list(domain_options.keys()) + ["Other (type manually)"]
         selected_domain = st.selectbox("Select a Domain:", domain_list)
@@ -2905,9 +3325,9 @@ def main():
                 get_crossref_data,
                 get_openalex_data,
                 get_scopus_data,
-                get_wos_data,
-                get_ai_data
-            ]
+                get_wos_data
+                #get_ai_data
+            ] 
             api_get_functions = {
                 "Semantic Scholar API": get_semantic_data,
                 "DOAJ API": get_doaj_data,
@@ -2922,7 +3342,7 @@ def main():
                 "OpenAlex API": get_openalex_data,
                 "Scopus API": get_scopus_data,
                 "Web of Science API": get_wos_data,
-                "AI-Assisted Search API": get_ai_data,
+                #"AI-Assisted Search API": get_ai_data,
                 "Multiple API Integration": all_api_functions
             }
             
@@ -2948,11 +3368,11 @@ def main():
     
         
 
-            df_api_type, performance_retrieval, collection_retrieval, db_ids = run_retrieval_pipeline(query, all_results_get, api_option, keywords, selected_domain_final, selected_field_final)
+            df_api_type, average_ragas_scores, performance_retrieval, collection_retrieval, db_ids = run_retrieval_pipeline(query, all_results_get, api_option, keywords, selected_domain_final, selected_field_final)
             st.session_state.df_api_type = df_api_type
+            st.session_state.average_ragas_scores = average_ragas_scores
             st.session_state.performance_retrieval = performance_retrieval
             st.session_state.collection_retrieval = collection_retrieval
-            #st.session_state.rag_metrics = rag_metrics
             st.session_state.page_index = 0  # reset pagination saat search baru
             st.session_state.db_ids = db_ids
                         
@@ -2964,11 +3384,10 @@ def main():
 
             
     if not st.session_state.df_api_type.empty:
-        
+        average_ragas_scores = st.session_state.average_ragas_scores.copy()
         df_api_type = st.session_state.df_api_type.copy()
         performance_retrieval =  st.session_state.performance_retrieval.copy()
         collection_retrieval = st.session_state.collection_retrieval.copy()
-        #rag_metrics = st.session_state.rag_metrics.copy()
         db_ids = st.session_state.db_ids.copy()
         
         rating_options = ["👍 High Relevant", "👌 Moderate Relevant", "✋ Somewhat Relevant", "👎 Low Relevance"]
@@ -3000,9 +3419,6 @@ def main():
                 #)
             }
 
-       
-
-                
         col_showall, col_sort = st.columns([8, 1])
         
         
@@ -3026,7 +3442,7 @@ def main():
                 "Somewhat relevant": 1,
                 "Low relevance": 0
             }
-            df_api_type['_Relevance_Score'] = df_api_type['AI Relevance Category'].map(relevance_map)
+            df_api_type['_Relevance_Score'] = df_api_type['Human and AI Ratings'].map(relevance_map)
             
             
 
@@ -3036,12 +3452,12 @@ def main():
             if show_all:
                 sort_column = st.selectbox(
                     "Sort By:",
-                    options=["Impact Factor", "Citation Count","AI Relevance Category"],
+                    options=["Impact Factor", "Citation Count","Human and AI Ratings"],
                     index=0,
                     
-                )
+                ) 
 
-                if sort_column == "AI Relevance Category":
+                if sort_column == "Human and AI Ratings":
                     df_api_type = df_api_type.sort_values(by=["_Relevance_Score","Similarity Score"],ascending=[False, False]).reset_index(drop=True)
 
                 else:
@@ -3119,14 +3535,30 @@ def main():
                     
         st.write(f"**Successfully Collected:** {collection_retrieval.get('successfully_collected','N/A')} paper(s)")
         st.write("")
-                
-                
-        #if rag_metrics:
-         #   st.write(f"**Generation Metrics**")
-          #  st.write(f"**Answer Relevancy:** {rag_metrics.get('Answer Relevancy',0) * 100:.2f}%")
-           # st.write(f"**Faithfulness:** {rag_metrics.get('Faithfulness',0) * 100:.2f}%")
-            #st.write("")       
         
+        
+        
+        #with ThreadPoolExecutor() as executor:
+         #   results_rag_metric = list(
+          #  executor.map(lambda row: rag_metrics_embeddings(row, query, keywords, model), [row for _, row in df_api_type.iterrows()])
+    
+        #)
+        
+        
+        #eval_df_rag_metric = pd.DataFrame(results_rag_metric)
+        #top10 = eval_df_rag_metric.head(10)
+        #top10.to_csv("output_rag_metrics.csv",index=False,encoding="utf-8-sig")
+        #answer_relevancy, faithfulness = top10.mean()
+        #answer_relevancy, faithfulness = eval_df_rag_metric.mean()
+        #rag_metrics_get =  {'Answer Relevancy': answer_relevancy, 'Faithfulness': faithfulness}
+                
+        if average_ragas_scores:
+            st.write(f"**Generation Metrics**")
+            st.write(f"**Faithfulness:** {average_ragas_scores.get('Faithfulness',0) * 100:.2f}%")
+            st.write(f"**Explanation Relevance:** {average_ragas_scores.get('Explanation Relevance',0) * 100:.2f}%")
+            
+            st.write("")       
+         
         
         if performance_retrieval:
             st.write(f"**Resource Performance Metrics**")
@@ -3140,12 +3572,16 @@ def main():
             f"({performance_retrieval.get('Total CPU Usage in Core')} cores)")
 
 		
+            # Urutkan berdasarkan Relevance Score (tertinggi di atas)
+            df_api_type= df_api_type.sort_values(
+            by=["_Relevance_Score","Similarity Score"],
+            ascending=[False, False]
+            ).reset_index(drop=False)
 
-
-            df_api_type = df_api_type.sort_values(
-            by="_Relevance_Score",
-            ascending=False
-            ).reset_index(drop=True)
+            #df_api_type = df_api_type.sort_values(
+            #by="_Relevance_Score",
+            #ascending=False
+            #).reset_index(drop=True)
 
             cols_to_drop = [
             "👍 High Relevant",
@@ -3163,6 +3599,8 @@ def main():
              )
             .encode("utf-8")
             )
+            
+            #torch.cuda.empty_cache()
 	    
 		
             st.download_button(
